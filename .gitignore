@@ -1,0 +1,39 @@
+
+# ==========================================
+# PROYECTO I - MACHINE LEARNING
+# ==========================================
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Archivos temporales
+*.tmp
+*.log
+~$*.xlsx
+~$*.xls
+
+# Archivos del sistema
+.DS_Store
+Thumbs.db
+
+# Configuración local
+.vscode/
+.idea/
+
+# Variables de entorno y credenciales
+.env
+.env.*
+
+# Cachés de herramientas
+.pytest_cache/
+.mypy_cache/
