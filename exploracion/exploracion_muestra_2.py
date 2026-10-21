@@ -2,7 +2,7 @@ import pandas as pd
 
 # ANALISIS DESCRIPTIVO DE LOS DATOS DE LA MUESTRA 2
 # Importamos la segunda muestra del archivo Excel.
-muestra_2 = pd.read_excel("data\Muestras a Clavetear.xlsx", sheet_name="Muestra_2")
+muestra_2 = pd.read_excel("data/Muestras a Clavetear.xlsx", sheet_name="Muestra_2")
 
 # Examinamos la estructura de los datos.
 muestra_2.info()
