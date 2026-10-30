@@ -22,6 +22,20 @@ with redirect_stdout(StringIO()):
 muestra_1_homologada = datos["muestra_1_homologada"].copy()
 catalogo_homologado = datos["catalogo"].copy()
 
+# Homologamos las marcas adicionales indicadas para el claveteo.
+# Trabajamos sobre una copia; la muestra y el catálogo originales no se modifican.
+equivalencias_adicionales_marca = {
+    "GMOTORS": "GMC",
+    "GM MOTORS": "GMC",
+    "GENERAL MOTORS": "GMC",
+    "GM": "GMC",
+    "MAYBACH": "MERCEDES BENZ"
+}
+
+muestra_1_homologada["Marca"] = (
+    muestra_1_homologada["Marca"].replace(equivalencias_adicionales_marca)
+)
+
 # Unificamos las categorías de motor en mayúsculas.
 catalogo_homologado["MOTOR"] = catalogo_homologado["MOTOR"].str.upper()
 
@@ -285,23 +299,169 @@ for indice_muestra in range(len(muestra_1_homologada)):
         ] = mejor_candidato["ID"]
 
 
-# Creamos la carpeta de resultados únicamente si no existe.
+# ==============================================================================
+# FASE 2A: GOWER DE MARCA Y MODELO (±5 AÑOS) + SIMILITUD TEXTUAL DE TIPO
+# FASE 2B: MARCA + TIPO TEXTUAL + MAYOR VALOR COMERCIAL
+# ==============================================================================
+# La primera fase termina arriba. Ninguna clave de esa fase se reemplaza.
+
+# Parámetros ajustables de los rescates.
+tolerancia_modelo = 5
+umbral_tipo_fase2 = 0.80
+umbral_tipo_fase3 = 0.85
+peso_gower_fase2 = 0.50
+peso_tipo_fase2 = 0.50
+
+# Preparamos únicamente las columnas auxiliares que requieren las nuevas fases.
+# No modificamos los valores originales del catálogo.
+marcas_catalogo_rescate = (
+    catalogo_homologado["MARCA"].astype("string").str.strip().str.upper()
+)
+tipos_catalogo_rescate = (
+    catalogo_homologado["TIPO"].astype("string").str.strip().str.upper()
+)
+modelos_catalogo_rescate = pd.to_numeric(
+    catalogo_homologado["MODELO"], errors="coerce"
+)
+precios_catalogo_rescate = pd.to_numeric(
+    catalogo_homologado["COMERCIAL"].astype("string")
+    .str.replace(r"[$,\s]", "", regex=True),
+    errors="coerce"
+)
+
+
+def clavetear_rescate(indice_muestra):
+    """Devuelve (candidato, fase) o (None, None) si no hay correspondencia."""
+    vehiculo = muestra_1_homologada.iloc[indice_muestra]
+
+    if pd.isna(vehiculo["Marca"]) or pd.isna(vehiculo["Tipo"]):
+        return None, None
+
+    marca = str(vehiculo["Marca"]).strip().upper()
+    tipo = str(vehiculo["Tipo"]).strip().upper()
+    if not marca or not tipo:
+        return None, None
+
+    # Ambas fases requieren la misma marca comercial homologada.
+    candidatos = catalogo_homologado.loc[
+        marcas_catalogo_rescate.eq(marca).fillna(False)
+    ].copy()
+    if candidatos.empty:
+        return None, None
+
+    # Evaluamos el Tipo con la función textual ya usada en la primera fase:
+    # 75 % Token Set Ratio + 25 % Token Sort Ratio.
+    # Reutilizamos el puntaje por Tipo distinto para evitar cálculos repetidos.
+    tipos_unicos = tipos_catalogo_rescate.loc[candidatos.index].dropna().unique()
+    puntajes_tipo = {
+        tipo_catalogo: similitud_textual(tipo, tipo_catalogo)
+        for tipo_catalogo in tipos_unicos
+        if tipo_catalogo
+    }
+    candidatos["similitud_tipo_rescate"] = (
+        tipos_catalogo_rescate.loc[candidatos.index].map(puntajes_tipo)
+    )
+
+    # --------------------------------------------------------------------------
+    # FASE 2A. Marca exacta, año a no más de 5 años y Tipo suficientemente similar.
+    # --------------------------------------------------------------------------
+    modelo_muestra = pd.to_numeric(
+        pd.Series([vehiculo["Modelo"]]), errors="coerce"
+    ).iloc[0]
+
+    if pd.notna(modelo_muestra):
+        diferencias = (
+            modelos_catalogo_rescate.loc[candidatos.index] - modelo_muestra
+        ).abs()
+
+        elegibles = candidatos.loc[
+            diferencias.le(tolerancia_modelo).fillna(False)
+            & candidatos["similitud_tipo_rescate"].ge(umbral_tipo_fase2)
+        ].copy()
+
+        if not elegibles.empty:
+            elegibles["diferencia_modelo"] = diferencias.loc[elegibles.index]
+
+            # Gower mixto: Marca categórica (1 por igualdad) y Modelo numérico.
+            # El Modelo se normaliza con la tolerancia de 5 años.
+            similitud_modelo = (
+                1 - elegibles["diferencia_modelo"] / tolerancia_modelo
+            ).clip(lower=0, upper=1)
+            elegibles["gower_rescate"] = (1.0 + similitud_modelo) / 2
+
+            # Entre los elegibles, gana la mayor similitud combinada.
+            elegibles["similitud_rescate"] = (
+                peso_gower_fase2 * elegibles["gower_rescate"]
+                + peso_tipo_fase2 * elegibles["similitud_tipo_rescate"]
+            )
+            mejor = elegibles.sort_values(
+                ["similitud_rescate", "similitud_tipo_rescate", "diferencia_modelo"],
+                ascending=[False, False, True],
+                kind="stable"
+            ).iloc[0]
+            return mejor, "2A"
+
+    # --------------------------------------------------------------------------
+    # FASE 2B. Si sigue sin clave: misma marca, Tipo ≥ 85 % y mayor valor comercial.
+    # No exigimos coincidencia de año-modelo ni de versión.
+    # --------------------------------------------------------------------------
+    elegibles = candidatos.loc[
+        candidatos["similitud_tipo_rescate"].ge(umbral_tipo_fase3)
+    ].copy()
+    if elegibles.empty:
+        return None, None
+
+    elegibles["precio_comercial"] = precios_catalogo_rescate.loc[elegibles.index]
+    elegibles = elegibles.dropna(subset=["precio_comercial"])
+    if elegibles.empty:
+        return None, None
+
+    # El valor comercial es el criterio principal; el Tipo rompe empates.
+    mejor = elegibles.sort_values(
+        ["precio_comercial", "similitud_tipo_rescate"],
+        ascending=[False, False],
+        kind="stable"
+    ).iloc[0]
+    return mejor, "2B"
+
+
+# Ejecutamos los rescates solo sobre los registros sin clave en la primera fase.
+asignados_primera_fase = int(muestra_1_homologada["ID_asignado"].notna().sum())
+pendientes = np.flatnonzero(muestra_1_homologada["ID_asignado"].isna().to_numpy())
+
+asignados_fase_2a = 0
+asignados_fase_2b = 0
+
+for indice_muestra in pendientes:
+    candidato, fase = clavetear_rescate(indice_muestra)
+    if candidato is None:
+        continue
+
+    muestra_1_homologada.at[
+        muestra_1_homologada.index[indice_muestra], "ID_asignado"
+    ] = candidato["ID"]
+
+    if fase == "2A":
+        asignados_fase_2a += 1
+    elif fase == "2B":
+        asignados_fase_2b += 1
+
+
+# Exportamos el resultado dentro del repositorio.
 carpeta_resultados = Path(__file__).resolve().parent.parent / "Resultados"
 carpeta_resultados.mkdir(parents=True, exist_ok=True)
-
-# Definimos la ruta del Excel con los resultados del claveteo.
 ruta_salida = carpeta_resultados / "Muestra_1_claveteada.xlsx"
 
-# Exportamos la muestra homologada con las claves asignadas.
-# El archivo se sobrescribe automáticamente en cada ejecución.
+# Se sobrescribe el mismo Excel en cada ejecución.
 muestra_1_homologada.to_excel(ruta_salida, index=False)
 
-# Presentamos únicamente el resumen final de resultados.
-asignados = muestra_1_homologada["ID_asignado"].notna().sum()
-sin_asignar = len(muestra_1_homologada) - asignados
-
+# Resumen del claveteo.
+asignados = int(muestra_1_homologada["ID_asignado"].notna().sum())
 print("\nClaveteo de la Muestra 1 finalizado.")
 print("Total de vehículos:", len(muestra_1_homologada))
+print("Asignados en primera fase:", asignados_primera_fase)
+print("Asignados en fase 2A (Gower + Tipo):", asignados_fase_2a)
+print("Asignados en fase 2B (mayor COMERCIAL):", asignados_fase_2b)
 print("Vehículos con clave asignada:", asignados)
-print("Vehículos sin clave asignada:", sin_asignar)
+print("Vehículos sin clave asignada:", len(muestra_1_homologada) - asignados)
 print("Archivo generado:", ruta_salida)
